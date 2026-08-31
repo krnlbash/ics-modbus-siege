@@ -48,13 +48,14 @@ happens to log.
 
 ## Architecture
 
-```
-+------------------+        Modbus TCP        +---------------------+
-|  modbus_toolkit   | <-----------------------> |     track_sim        |
-|  (attacker CLI)   |     (no auth, cleartext)   | (simulated PLC/HMI)  |
-+------------------+                            +---------------------+
-                                                    logs every write
-                                                    with source IP
+```mermaid
+flowchart LR
+    A["modbus_toolkit<br/><i>attacker CLI</i>"] -- "Modbus TCP<br/>no auth · cleartext" --> B["track_sim<br/><i>simulated PLC / HMI</i>"]
+    B -- "every write logged<br/>with source IP" --> C[("attack log<br/>stdout")]
+
+    style A fill:#1f2430,stroke:#e06c75,color:#fff
+    style B fill:#1f2430,stroke:#61afef,color:#fff
+    style C fill:#1f2430,stroke:#98c379,color:#fff
 ```
 
 See [`docs/register-map.md`](docs/register-map.md) for the full coil/register

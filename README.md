@@ -49,7 +49,7 @@ happens to log.
 ## Architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
     A["modbus_toolkit<br/><i>attacker CLI</i>"] -- "Modbus TCP<br/>no auth · cleartext" --> B["track_sim<br/><i>simulated PLC / HMI</i>"]
     B -- "every write logged<br/>with source IP" --> C[("attack log<br/>stdout")]
 

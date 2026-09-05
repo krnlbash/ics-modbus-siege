@@ -1,11 +1,11 @@
-# ics-radar-toolkit
+# ics-modbus-siege
 
-A Modbus TCP ICS attack toolkit and target simulator, built around a simplified
-**track-management PLC** — the kind of controller that could sit between a
-radar/sensor feed and an operator display (HMI) in a track-management
-architecture. Written in C++ against [libmodbus](https://libmodbus.org/), the
-library many real-world Modbus TCP integrations (including industrial and
-research tooling) are built on.
+A Modbus TCP ICS attack toolkit, defensive gateway, and target simulator,
+built around a simplified **track-management PLC** — the kind of controller
+that could sit between a sensor feed and an operator display (HMI) in an
+industrial control system. Written in C++ against
+[libmodbus](https://libmodbus.org/), the library many real-world Modbus TCP
+integrations (including industrial and research tooling) are built on.
 
 This exists because unauthenticated Modbus TCP is still common in the field,
 and the impact of that exposure is easier to reason about with a concrete,
@@ -25,13 +25,31 @@ factory device.
 
 ## Real-world relevance
 
-Modbus is widely used in industrial automation across sectors including
-cement manufacturing, water treatment, and building automation — including
-within Pakistan's growing industrial automation sector. The "track-management"
-framing here is illustrative rather than a reproduction of a real air-defense
-system (see Scope and ethics below), but the underlying protocol, data model,
-and lack of authentication are exactly what's deployed in these real
-industrial contexts today.
+Modbus TCP is a real, still-widely-deployed protocol — the mechanics
+demonstrated here (unauthenticated enumeration, unauthorized writes,
+fuzzing for missing bounds checks, access-control reconnaissance) transfer
+directly to genuine Modbus deployments. The "track-management" framing is
+illustrative rather than a reproduction of a real air-defense, radar, or
+IFF system — see Scope and ethics below for what this project does and
+does not represent.
+
+**Where Modbus is actually deployed:**
+
+- **Manufacturing plants generally** — cement, food processing, textiles,
+  chemicals — anywhere PLCs control conveyor belts, mixers, kilns, or
+  packaging lines. This is Modbus's original and still most common home,
+  including within Pakistan's growing industrial automation sector.
+- **Water/wastewater treatment** — pump stations, valve control
+- **Building automation** — HVAC, access control, elevators in large
+  facilities, including on military bases for general facility
+  infrastructure — not weapons or radar systems
+- **Drone manufacturing plants** — the factory floor building the drones
+  (conveyor lines, assembly robots, quality-control stations) plausibly
+  runs Modbus-based automation like any other manufacturing facility. A
+  drone's own onboard flight systems are a separate, unrelated domain this
+  project has nothing to do with.
+- **Oil & gas, power distribution** — pipeline monitoring, some substation
+  equipment
 
 ## Why this, and why this framing
 
@@ -48,6 +66,8 @@ happens to log.
 
 ## Architecture
 
+**Level 1 — no defenses.** The toolkit talks directly to the simulated PLC.
+
 ```mermaid
 flowchart TD
     A["modbus_toolkit<br/><i>attacker CLI</i>"] -- "Modbus TCP<br/>no auth · cleartext" --> B["track_sim<br/><i>simulated PLC / HMI</i>"]
@@ -58,8 +78,25 @@ flowchart TD
     style C fill:#1f2430,stroke:#98c379,color:#fff
 ```
 
-See [`docs/register-map.md`](docs/register-map.md) for the full coil/register
-layout and the threat model it maps to.
+**Level 2 — access-control gateway.** A proxy now sits in front of the PLC,
+enforcing a source-IP + function-code + address-range whitelist on every
+write. Reads stay open to anyone.
+
+```mermaid
+flowchart TD
+    A["modbus_toolkit<br/><i>untrusted attacker</i>"] -- "writes denied<br/>reads allowed" --> G["modbus_gateway<br/><i>ACL enforcement</i>"]
+    D["modbus_toolkit --bind-ip<br/><i>trusted console</i>"] -- "writes allowed<br/>within policy" --> G
+    G -- "forwarded requests only" --> B["track_sim<br/><i>simulated PLC / HMI</i>"]
+
+    style A fill:#1f2430,stroke:#e06c75,color:#fff
+    style D fill:#1f2430,stroke:#98c379,color:#fff
+    style G fill:#1f2430,stroke:#e5c07b,color:#fff
+    style B fill:#1f2430,stroke:#61afef,color:#fff
+```
+
+See [`docs/register-map.md`](docs/register-map.md) for the coil/register
+layout, and [`docs/gateway-rules.md`](docs/gateway-rules.md) for the exact
+Level 2 access-control policy.
 
 ## Components
 
@@ -67,6 +104,11 @@ layout and the threat model it maps to.
   track-management PLC: 4 tracks, each with active/inactive state, IFF
   friend/foe status, and bearing/range/altitude/speed. Logs every write it
   receives, tagged with the source IP, so it doubles as an attack log.
+- **`gateway/modbus_gateway.cpp`** — the Level 2 access-control proxy.
+  Parses each Modbus TCP request at the wire level and enforces a
+  source-IP + function-code + address-range whitelist before forwarding
+  to `track_sim`, returning real Modbus exception codes on denial. See
+  `docs/gateway-rules.md` for the exact policy.
 - **`toolkit/modbus_toolkit.cpp`** — the attack CLI:
   - `enumerate` — dump all coils, holding registers, and input registers
   - `spoof-iff <track> <0|1>` — flip a track's IFF friend/foe status
@@ -77,6 +119,10 @@ layout and the threat model it maps to.
   - `ghost-track <track>` — fabricate a track with no underlying sensor data
   - `fuzz <iterations>` — send malformed/out-of-range function-code requests
     and report which ones the target accepted when it shouldn't have
+  - `probe-acl` — map out a Level 2 gateway's write policy by testing a
+    spread of addresses and classifying each response
+  - `--bind-ip <ip>` — connect from a specific local source IP, to present
+    as the trusted console against the Level 2 gateway
 
 ## Build
 
@@ -91,13 +137,11 @@ make
 
 ## Run
 
-Start the simulator in one terminal:
+**Level 1 — direct, no defenses:**
 
 ```bash
 ./build/track_sim 127.0.0.1 15020
 ```
-
-Run the toolkit against it in another:
 
 ```bash
 ./build/modbus_toolkit 127.0.0.1 15020 enumerate
@@ -107,23 +151,39 @@ Run the toolkit against it in another:
 ./build/modbus_toolkit 127.0.0.1 15020 fuzz 200
 ```
 
-Watch the simulator's terminal — every write is logged with the attacking
-client's IP, so you can see the attack land on the "PLC" side in real time.
+**Level 2 — through the access-control gateway:**
+
+```bash
+./build/track_sim 127.0.0.1 15020
+./build/modbus_gateway 127.0.0.1 15021 127.0.0.1 15020
+```
+
+```bash
+# Untrusted attacker — writes denied, reads still work
+./build/modbus_toolkit 127.0.0.1 15021 probe-acl
+
+# Trusted console — writes allowed within policy, still capped outside it
+./build/modbus_toolkit --bind-ip 127.0.0.2 127.0.0.1 15021 probe-acl
+```
+
+Watch the gateway's terminal — it logs an ALLOW/DENY decision with the
+reason for every request, so you can see the policy being enforced live.
 
 ## Defensive notes
 
-This same exercise motivates the standard Modbus/ICS mitigations, none of
-which this toolkit implements bypasses for because the base protocol has no
-such controls to bypass:
+Level 2 implements one real mitigation (an access-control gateway). The
+rest of the standard Modbus/ICS mitigations this exercise motivates are
+still not implemented here, since the point is to add them one at a time:
 
 - Network segmentation — ICS/OT networks should not be reachable from IT or
   the internet; Modbus TCP has no business being routable outside a
   purpose-built OT segment
-- Modbus-aware firewalls / DPI that enforce which function codes and
-  register ranges a given client is allowed to touch
-- Wrapping Modbus in an authenticated tunnel (e.g. VPN or a protocol gateway)
-  since Modbus itself won't provide this
-- Application-layer bounds checking on the PLC side — this simulator
+- Authentication beyond IP-based trust (IP addresses are spoofable in ways
+  a real token/credential isn't) — see `docs/gateway-rules.md` for how the
+  current gateway's trust model works and where it stops
+- Wrapping Modbus in an authenticated, encrypted tunnel (e.g. TLS or a VPN)
+  since Modbus itself provides neither
+- Application-layer bounds checking on the PLC side — `track_sim`
   deliberately omits it (see the `fuzz` results) to mirror real deployments
   that also often omit it
 
@@ -132,6 +192,9 @@ such controls to bypass:
 - This toolkit is built and tested only against the bundled simulator.
 - The "track-management" framing is illustrative — it is not a reproduction
   of any real radar, IFF, or air-defense system, protocol, or product.
+  Real air-defense, radar, and avionics systems use specialized, typically
+  classified or hardened protocols with no resemblance to Modbus; nothing
+  here is transferable to that domain.
 - Only run this against systems you own or are explicitly authorized to
   test. Unauthenticated Modbus TCP attacks against real ICS/SCADA
   infrastructure without authorization are illegal in most jurisdictions and

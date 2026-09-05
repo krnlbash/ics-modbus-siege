@@ -16,3 +16,6 @@ add_executable(modbus_toolkit toolkit/modbus_toolkit.cpp)
 target_include_directories(modbus_toolkit PRIVATE ${MODBUS_INCLUDE_DIRS})
 target_link_libraries(modbus_toolkit ${MODBUS_LIBRARIES})
 target_compile_options(modbus_toolkit PRIVATE ${MODBUS_CFLAGS_OTHER} -Wall -Wextra)
+
+add_executable(modbus_gateway gateway/modbus_gateway.cpp)
+target_compile_options(modbus_gateway PRIVATE -Wall -Wextra)
